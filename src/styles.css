@@ -196,6 +196,72 @@ button.active {
   color: #7fe6b0;
 }
 
+/* 候选接缝列表 */
+.candidates h2 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.candidates table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.candidates th,
+.candidates td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid #232c40;
+}
+
+.candidates th {
+  color: #9aa7bd;
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.candidates tbody tr {
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.candidates tbody tr:hover {
+  background: rgba(91, 141, 239, 0.08);
+}
+
+.candidates tbody tr.selected {
+  background: rgba(47, 210, 125, 0.1);
+}
+
+.candidates tbody tr.selected td {
+  color: #7fe6b0;
+}
+
+.rank {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  background: rgba(47, 210, 125, 0.16);
+  color: #7fe6b0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.candidates tr.selected .rank {
+  background: #2fd27d;
+  color: #06251a;
+}
+
+.row-state {
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
 .cost {
   margin: 10px 0 0;
   font-size: 12px;

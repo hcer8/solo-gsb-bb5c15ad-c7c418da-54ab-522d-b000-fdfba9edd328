@@ -8,18 +8,52 @@ export interface Region {
   end: number;
 }
 
+export interface SeamMarker {
+  /** 秒 */
+  start: number;
+  /** 秒 */
+  end: number;
+  /** 候选编号（与候选列表对应，如 "1"） */
+  label: string;
+  /** 当前选中项（导出目标），高亮显示 */
+  selected: boolean;
+}
+
 interface WaveformProps {
   buffer: AudioBuffer | null;
   /** 用户粗选区间（橙色边界，可拖动） */
   selection: Region | null;
-  /** 优化后的接缝位置（绿色标记） */
-  optimized: Region | null;
+  /** 候选接缝标记（按代价排序编号） */
+  markers: SeamMarker[];
   onSelectionChange: (region: Region) => void;
 }
 
 const HEIGHT = 260;
 const HANDLE_HIT_PX = 8;
 const MIN_REGION_SEC = 0.02;
+
+/** 绘制候选编号徽标（带底色的小色块），横向自动夹取在画布内 */
+function drawBadge(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  label: string,
+  selected: boolean,
+  align: 'left' | 'right',
+  canvasWidth: number,
+): void {
+  ctx.font = 'bold 11px system-ui, sans-serif';
+  const w = Math.max(16, Math.ceil(ctx.measureText(label).width) + 10);
+  const h = 14;
+  let bx = align === 'left' ? x + 3 : x - 3 - w;
+  bx = Math.max(1, Math.min(bx, canvasWidth - w - 1));
+  ctx.fillStyle = selected ? '#2fd27d' : 'rgba(47,210,125,0.35)';
+  ctx.fillRect(bx, y, w, h);
+  ctx.fillStyle = selected ? '#06251a' : '#d8e6de';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, bx + w / 2, y + h / 2 + 0.5);
+}
 
 interface Peaks {
   mins: Float32Array;
@@ -52,7 +86,7 @@ function computePeaks(buffer: AudioBuffer, columns: number): Peaks {
   return { mins, maxs };
 }
 
-export function Waveform({ buffer, selection, optimized, onSelectionChange }: WaveformProps) {
+export function Waveform({ buffer, selection, markers, onSelectionChange }: WaveformProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [width, setWidth] = useState(0);
@@ -145,20 +179,30 @@ export function Waveform({ buffer, selection, optimized, onSelectionChange }: Wa
       ctx.fillRect(x2 - 4, 0, 8, 6);
     }
 
-    // 优化后的接缝标记
-    if (optimized) {
-      const x1 = (optimized.start / duration) * width;
-      const x2 = (optimized.end / duration) * width;
-      ctx.fillStyle = 'rgba(47,210,125,0.10)';
-      ctx.fillRect(x1, 0, x2 - x1, HEIGHT);
-      ctx.fillStyle = '#2fd27d';
-      ctx.fillRect(x1 - 1, 0, 2, HEIGHT);
-      ctx.fillRect(x2 - 1, 0, 2, HEIGHT);
-      ctx.font = '11px system-ui, sans-serif';
-      ctx.textAlign = 'left';
-      ctx.fillText('优化接缝', x1 + 6, 14);
+    // 候选接缝标记：未选中的先画，选中的最后画（置于上层）
+    if (markers.length > 0) {
+      const drawMarker = (m: SeamMarker, idx: number) => {
+        const x1 = (m.start / duration) * width;
+        const x2 = (m.end / duration) * width;
+        if (m.selected) {
+          ctx.fillStyle = 'rgba(47,210,125,0.10)';
+          ctx.fillRect(x1, 0, x2 - x1, HEIGHT);
+        }
+        ctx.fillStyle = m.selected ? '#2fd27d' : 'rgba(47,210,125,0.4)';
+        ctx.fillRect(x1 - 1, 0, 2, HEIGHT);
+        ctx.fillRect(x2 - 1, 0, 2, HEIGHT);
+        // 编号徽标：起点侧顶部、终点侧底部，按候选序号纵向错位避免互相遮挡
+        drawBadge(ctx, x1, 6 + idx * 16, m.label, m.selected, 'left', width);
+        drawBadge(ctx, x2, HEIGHT - 40 - idx * 16, m.label, m.selected, 'right', width);
+      };
+      markers.forEach((m, idx) => {
+        if (!m.selected) drawMarker(m, idx);
+      });
+      markers.forEach((m, idx) => {
+        if (m.selected) drawMarker(m, idx);
+      });
     }
-  }, [peaks, selection, optimized, width, buffer, duration]);
+  }, [peaks, selection, markers, width, buffer, duration]);
 
   const xToTime = useCallback(
     (clientX: number): number => {

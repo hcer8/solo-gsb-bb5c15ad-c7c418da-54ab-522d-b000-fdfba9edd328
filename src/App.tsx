@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Waveform, type Region } from './components/Waveform';
 import { LoopPlayer } from './audio/player';
 import { decodeAudioFile } from './audio/decode';
-import { findBestSeam, type SeamResult } from './audio/loopFinder';
+import { findSeamCandidates, type SeamResult } from './audio/loopFinder';
 import { buildLoopPcm } from './audio/loopBuffer';
 import { encodeWav, wavFileSize } from './audio/wavExport';
 import { fmtBytes, fmtTime } from './utils/format';
@@ -10,6 +10,10 @@ import { fmtBytes, fmtTime } from './utils/format';
 const SLOPE_WINDOW = 32;
 const SLOPE_WEIGHT = 1;
 const MIN_LOOP_SECONDS = 0.05;
+/** 候选接缝数量上限 */
+const MAX_CANDIDATES = 5;
+/** 候选去重阈值：起止点均相距不足该值视为同一接缝 */
+const DEDUPE_MS = 10;
 
 type PlayTarget = 'original' | 'optimized';
 
@@ -17,7 +21,8 @@ export default function App() {
   const [fileName, setFileName] = useState('');
   const [buffer, setBuffer] = useState<AudioBuffer | null>(null);
   const [selection, setSelection] = useState<Region | null>(null);
-  const [seam, setSeam] = useState<SeamResult | null>(null);
+  const [candidates, setCandidates] = useState<SeamResult[]>([]);
+  const [selectedCandidate, setSelectedCandidate] = useState(0);
   const [seamRadiusMs, setSeamRadiusMs] = useState<number | null>(null);
   const [radiusMs, setRadiusMs] = useState(50);
   const [crossfadeMs, setCrossfadeMs] = useState(20);
@@ -27,6 +32,17 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false);
   const playerRef = useRef<LoopPlayer | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // 当前选中的候选接缝：试听与导出的目标
+  const seam: SeamResult | null =
+    candidates.length > 0 ? candidates[Math.min(selectedCandidate, candidates.length - 1)] : null;
+
+  /** 清空候选（选区或搜索半径变化后，旧的试听/导出目标一并失效） */
+  const clearCandidates = useCallback(() => {
+    setCandidates([]);
+    setSelectedCandidate(0);
+    setSeamRadiusMs(null);
+  }, []);
 
   const getPlayer = (): LoopPlayer => {
     if (!playerRef.current) playerRef.current = new LoopPlayer();
@@ -51,8 +67,7 @@ export default function App() {
       setBuffer(buf);
       setFileName(file.name);
       setSelection(null);
-      setSeam(null);
-      setSeamRadiusMs(null);
+      clearCandidates();
       setStatus(
         `已加载：${file.name} — ${buf.sampleRate} Hz / ${buf.numberOfChannels} 声道 / 时长 ${fmtTime(buf.duration)}。请在波形上框选大致循环区间。`,
       );
@@ -78,38 +93,46 @@ export default function App() {
 
   const onSelectionChange = useCallback((region: Region) => {
     setSelection(region);
-    setSeam(null);
-    setSeamRadiusMs(null);
-  }, []);
+    clearCandidates();
+  }, [clearCandidates]);
 
-  /** 执行接缝搜索；返回结果（失败返回 null） */
-  const runSearch = useCallback((): SeamResult | null => {
+  /** 执行接缝搜索，给出代价最低的候选列表；返回结果（失败返回空数组） */
+  const runSearch = useCallback((): SeamResult[] => {
     if (!buffer || !selection) {
       setStatus('请先在波形上框选大致循环区间。');
-      return null;
+      return [];
     }
     const sr = buffer.sampleRate;
     const startS = selection.start * sr;
     const endS = selection.end * sr;
     if (endS - startS < MIN_LOOP_SECONDS * sr) {
       setStatus('选区太短，请框选更长的循环区间。');
-      return null;
+      return [];
     }
     const maxRadius = Math.max(1, (endS - startS) / 2 - 64);
     const radius = Math.min((radiusMs / 1000) * sr, maxRadius);
-    const result = findBestSeam(buffer, startS, endS, {
+    const results = findSeamCandidates(buffer, startS, endS, {
       radiusSamples: radius,
       slopeWindow: SLOPE_WINDOW,
       slopeWeight: SLOPE_WEIGHT,
+      maxCandidates: MAX_CANDIDATES,
+      dedupeSamples: (DEDUPE_MS / 1000) * sr,
     });
-    setSeam(result);
+    setCandidates(results);
+    setSelectedCandidate(0);
     setSeamRadiusMs(radiusMs);
-    const dStart = ((result.startSample - startS) / sr) * 1000;
-    const dEnd = ((result.endSample - endS) / sr) * 1000;
+    if (results.length === 0) {
+      setStatus('未找到满足条件的接缝，请扩大搜索半径或调整选区。');
+      return [];
+    }
+    const best = results[0];
+    const dStart = ((best.startSample - startS) / sr) * 1000;
+    const dEnd = ((best.endSample - endS) / sr) * 1000;
     setStatus(
-      `接缝搜索完成：起点移动 ${dStart >= 0 ? '+' : ''}${dStart.toFixed(1)} ms，终点移动 ${dEnd >= 0 ? '+' : ''}${dEnd.toFixed(1)} ms，代价 ${result.cost.toFixed(4)}。`,
+      `找到 ${results.length} 个候选接缝（已按 ${DEDUPE_MS} ms 去重）：最优起点移动 ${dStart >= 0 ? '+' : ''}${dStart.toFixed(1)} ms，` +
+        `终点移动 ${dEnd >= 0 ? '+' : ''}${dEnd.toFixed(1)} ms，代价 ${best.cost.toFixed(4)}。点选下方候选可对比试听。`,
     );
-    return result;
+    return results;
   }, [buffer, selection, radiusMs]);
 
   const playOriginal = useCallback(async () => {
@@ -123,17 +146,45 @@ export default function App() {
     setPlaying('original');
   }, [buffer, selection]);
 
+  /** 选中并循环试听第 index 个候选（list 缺省用当前候选列表） */
+  const playCandidate = useCallback(
+    async (index: number, list?: SeamResult[]) => {
+      const cands = list ?? candidates;
+      if (!buffer || cands.length === 0) return;
+      const i = Math.max(0, Math.min(index, cands.length - 1));
+      setSelectedCandidate(i);
+      const c = cands[i];
+      const pcm = buildLoopPcm(buffer, c.startSample, c.endSample, (crossfadeMs / 1000) * buffer.sampleRate);
+      await getPlayer().play(pcm);
+      setPlaying('optimized');
+    },
+    [buffer, candidates, crossfadeMs],
+  );
+
   const playOptimized = useCallback(async () => {
     if (!buffer) return;
-    let s = seam;
-    if (!s || seamRadiusMs !== radiusMs) {
-      s = runSearch();
+    let list = candidates;
+    if (list.length === 0) {
+      list = runSearch();
+      if (list.length === 0) return;
+      await playCandidate(0, list);
+      return;
     }
-    if (!s) return;
-    const pcm = buildLoopPcm(buffer, s.startSample, s.endSample, (crossfadeMs / 1000) * buffer.sampleRate);
-    await getPlayer().play(pcm);
-    setPlaying('optimized');
-  }, [buffer, seam, seamRadiusMs, radiusMs, crossfadeMs, runSearch]);
+    await playCandidate(selectedCandidate, list);
+  }, [buffer, candidates, selectedCandidate, runSearch, playCandidate]);
+
+  /** 点选候选：未在播放则选中并试听，再次点击当前项则停止 */
+  const onCandidateClick = useCallback(
+    (index: number) => {
+      if (playing === 'optimized' && index === selectedCandidate) {
+        getPlayer().stop();
+        setPlaying(null);
+        return;
+      }
+      void playCandidate(index);
+    },
+    [playing, selectedCandidate, playCandidate],
+  );
 
   const stopPlayback = useCallback(() => {
     getPlayer().stop();
@@ -174,8 +225,20 @@ export default function App() {
         crossfadeMs,
         slopeWindowSamples: SLOPE_WINDOW,
         slopeWeight: SLOPE_WEIGHT,
+        maxCandidates: MAX_CANDIDATES,
+        dedupeMs: DEDUPE_MS,
       },
       seamCost: seam.cost,
+      /** 全部候选（按代价升序），optimized 为其中 selectedCandidate 所指项 */
+      candidates: candidates.map((c, i) => ({
+        rank: i + 1,
+        startSec: c.startSample / sr,
+        endSec: c.endSample / sr,
+        startSample: c.startSample,
+        endSample: c.endSample,
+        cost: c.cost,
+      })),
+      selectedCandidate: Math.min(selectedCandidate, candidates.length - 1) + 1,
       exportedAt: new Date().toISOString(),
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -185,8 +248,8 @@ export default function App() {
     a.download = `${fileName.replace(/\.[^.]+$/, '') || 'loop'}.loop.json`;
     a.click();
     URL.revokeObjectURL(url);
-    setStatus('已导出 JSON（包含最终起止时间与搜索参数）。');
-  }, [buffer, selection, seam, fileName, radiusMs, crossfadeMs]);
+    setStatus(`已导出 JSON（候选 #${Math.min(selectedCandidate, candidates.length - 1) + 1} 的起止时间与全部候选列表）。`);
+  }, [buffer, selection, seam, candidates, selectedCandidate, fileName, radiusMs, crossfadeMs]);
 
   const exportWav = useCallback(() => {
     if (!buffer || !seam) return;
@@ -199,10 +262,11 @@ export default function App() {
     a.download = `${fileName.replace(/\.[^.]+$/, '') || 'loop'}.loop.wav`;
     a.click();
     URL.revokeObjectURL(url);
-    setStatus(`已导出 WAV：16-bit PCM，含 smpl 循环区块（0 → 最后一帧），共 ${fmtBytes(wav.byteLength)}。`);
-  }, [buffer, seam, crossfadeMs, fileName]);
+    setStatus(
+      `已导出 WAV（候选 #${Math.min(selectedCandidate, candidates.length - 1) + 1}）：16-bit PCM，含 smpl 循环区块（0 → 最后一帧），共 ${fmtBytes(wav.byteLength)}。`,
+    );
+  }, [buffer, seam, candidates, selectedCandidate, crossfadeMs, fileName]);
 
-  const seamStale = seam !== null && seamRadiusMs !== null && seamRadiusMs !== radiusMs;
   const sr = buffer?.sampleRate ?? 44100;
 
   // 导出 WAV 的帧数与预计大小（与 buildLoopPcm 的边界夹取逻辑保持一致；
@@ -221,7 +285,7 @@ export default function App() {
     <div className="app">
       <header className="header">
         <h1>无缝循环接缝查找器</h1>
-        <p>本地浏览器内分析音频，在粗选边界附近搜索幅值与短窗斜率最连续的接缝点，可 A/B 对比试听并导出参数。</p>
+        <p>本地浏览器内分析音频，在粗选边界附近搜索幅值与短窗斜率最连续的接缝点，给出代价最低的 5 个候选，可点选对比试听并导出选中项。</p>
       </header>
 
       <section
@@ -247,26 +311,32 @@ export default function App() {
 
       {buffer && (
         <>
-          <Waveform buffer={buffer} selection={selection} optimized={seam ? {
-            start: seam.startSample / sr,
-            end: seam.endSample / sr,
-          } : null} onSelectionChange={onSelectionChange} />
+          <Waveform
+            buffer={buffer}
+            selection={selection}
+            candidates={candidates.map((c) => ({ start: c.startSample / sr, end: c.endSample / sr }))}
+            selectedCandidate={selectedCandidate}
+            onSelectionChange={onSelectionChange}
+          />
           <div className="legend">
             <span><i className="swatch swatch-handle" /> 选区边界（可拖动）</span>
-            <span><i className="swatch swatch-seam" /> 优化后的接缝位置</span>
+            <span><i className="swatch swatch-seam" /> 候选接缝（编号按代价排序，高亮为当前选中）</span>
           </div>
 
           <section className="panel">
             <div className="sliders">
               <label>
-                <span>搜索半径：<b>{radiusMs} ms</b>{seamStale && <em className="stale">（已修改，请重新查找）</em>}</span>
+                <span>搜索半径：<b>{radiusMs} ms</b>（修改后需重新查找）</span>
                 <input
                   type="range"
                   min={5}
                   max={500}
                   step={5}
                   value={radiusMs}
-                  onChange={(e) => setRadiusMs(Number(e.target.value))}
+                  onChange={(e) => {
+                    setRadiusMs(Number(e.target.value));
+                    clearCandidates();
+                  }}
                 />
               </label>
               <label>
@@ -294,16 +364,46 @@ export default function App() {
                 className={playing === 'optimized' ? 'active' : ''}
                 onClick={() => (playing === 'optimized' ? stopPlayback() : void playOptimized())}
               >
-                {playing === 'optimized' ? '■ 停止' : '▶ 试听优化区间'}
+                {playing === 'optimized' ? '■ 停止' : '▶ 试听选中候选'}
               </button>
               <button onClick={stopPlayback} disabled={playing === null}>停止</button>
               <button onClick={exportJson} disabled={!seam || !selection}>下载 JSON</button>
               <button onClick={exportWav} disabled={!seam}>下载 WAV</button>
             </div>
 
+            {candidates.length > 0 && (
+              <div className="candidates">
+                <p className="candidates-title">
+                  候选接缝（按代价升序，已按起止点 {DEDUPE_MS} ms 去重）—— 点选循环试听，选中项即导出目标：
+                </p>
+                <ol>
+                  {candidates.map((c, i) => {
+                    const isSel = i === selectedCandidate;
+                    const isPlayingThis = isSel && playing === 'optimized';
+                    return (
+                      <li key={i}>
+                        <button
+                          className={`candidate${isSel ? ' selected' : ''}`}
+                          onClick={() => onCandidateClick(i)}
+                        >
+                          <span className="rank">#{i + 1}</span>
+                          <span className="range">
+                            {fmtTime(c.startSample / sr)} → {fmtTime(c.endSample / sr)}
+                            （{fmtTime((c.endSample - c.startSample) / sr)}）
+                          </span>
+                          <span className="candidate-cost">代价 {c.cost.toFixed(4)}</span>
+                          <span className="play-hint">{isPlayingThis ? '■ 停止' : '▶ 试听'}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+              </div>
+            )}
+
             {seam && buffer && (
               <p className="export-info">
-                WAV 导出：{buffer.sampleRate} Hz · {buffer.numberOfChannels} 声道 ·{' '}
+                WAV 导出（候选 #{Math.min(selectedCandidate, candidates.length - 1) + 1}）：{buffer.sampleRate} Hz · {buffer.numberOfChannels} 声道 ·{' '}
                 {wavFrames.toLocaleString()} 帧 · 预计 {fmtBytes(wavBytes)}
                 （16-bit PCM，含 smpl 循环区块）
               </p>
@@ -328,7 +428,7 @@ export default function App() {
                   <td>{selection ? fmtTime(selection.end - selection.start) : '—'}</td>
                 </tr>
                 <tr className="optimized-row">
-                  <td>优化区间</td>
+                  <td>{seam ? `优化区间（候选 #${Math.min(selectedCandidate, candidates.length - 1) + 1}）` : '优化区间'}</td>
                   <td>{seam ? fmtTime(seam.startSample / sr) : '—'}</td>
                   <td>{seam ? fmtTime(seam.endSample / sr) : '—'}</td>
                   <td>{seam ? fmtTime((seam.endSample - seam.startSample) / sr) : '—'}</td>
@@ -336,7 +436,10 @@ export default function App() {
               </tbody>
             </table>
             {seam && (
-              <p className="cost">接缝代价：{seam.cost.toFixed(4)}（越小越平滑） · 淡化 {crossfadeMs} ms · 半径 {seamRadiusMs} ms</p>
+              <p className="cost">
+                接缝代价：{seam.cost.toFixed(4)}（越小越平滑，候选 #{Math.min(selectedCandidate, candidates.length - 1) + 1} / 共 {candidates.length} 个）
+                · 淡化 {crossfadeMs} ms · 半径 {seamRadiusMs} ms
+              </p>
             )}
           </section>
         </>

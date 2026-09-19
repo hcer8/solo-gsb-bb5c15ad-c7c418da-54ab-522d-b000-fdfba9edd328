@@ -12,8 +12,10 @@ interface WaveformProps {
   buffer: AudioBuffer | null;
   /** 用户粗选区间（橙色边界，可拖动） */
   selection: Region | null;
-  /** 优化后的接缝位置（绿色标记） */
-  optimized: Region | null;
+  /** 候选接缝位置（绿色标记，数组顺序即代价排名，编号从 1 起） */
+  candidates: Region[];
+  /** 当前选中的候选索引（无候选时忽略） */
+  selectedCandidate: number;
   onSelectionChange: (region: Region) => void;
 }
 
@@ -52,7 +54,7 @@ function computePeaks(buffer: AudioBuffer, columns: number): Peaks {
   return { mins, maxs };
 }
 
-export function Waveform({ buffer, selection, optimized, onSelectionChange }: WaveformProps) {
+export function Waveform({ buffer, selection, candidates, selectedCandidate, onSelectionChange }: WaveformProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [width, setWidth] = useState(0);
@@ -145,20 +147,31 @@ export function Waveform({ buffer, selection, optimized, onSelectionChange }: Wa
       ctx.fillRect(x2 - 4, 0, 8, 6);
     }
 
-    // 优化后的接缝标记
-    if (optimized) {
-      const x1 = (optimized.start / duration) * width;
-      const x2 = (optimized.end / duration) * width;
-      ctx.fillStyle = 'rgba(47,210,125,0.10)';
-      ctx.fillRect(x1, 0, x2 - x1, HEIGHT);
-      ctx.fillStyle = '#2fd27d';
+    // 候选接缝标记（编号按代价升序，当前选中项高亮）
+    candidates.forEach((cand, i) => {
+      const x1 = (cand.start / duration) * width;
+      const x2 = (cand.end / duration) * width;
+      const isSel = i === selectedCandidate;
+      if (isSel) {
+        ctx.fillStyle = 'rgba(47,210,125,0.10)';
+        ctx.fillRect(x1, 0, x2 - x1, HEIGHT);
+      }
+      ctx.fillStyle = isSel ? '#2fd27d' : 'rgba(47,210,125,0.4)';
       ctx.fillRect(x1 - 1, 0, 2, HEIGHT);
       ctx.fillRect(x2 - 1, 0, 2, HEIGHT);
-      ctx.font = '11px system-ui, sans-serif';
+      // 编号标签：纵向按排名错开，避免相邻候选互相遮挡
+      const label = `#${i + 1}`;
+      ctx.font = `${isSel ? 'bold ' : ''}10px system-ui, sans-serif`;
+      const tx = Math.min(Math.max(x1 + 4, 2), width - 26);
+      const ty = 14 + i * 13;
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = isSel ? '#2fd27d' : 'rgba(47,210,125,0.35)';
+      ctx.fillRect(tx - 2, ty - 9, tw + 5, 12);
+      ctx.fillStyle = isSel ? '#06180f' : '#e6ebf5';
       ctx.textAlign = 'left';
-      ctx.fillText('优化接缝', x1 + 6, 14);
-    }
-  }, [peaks, selection, optimized, width, buffer, duration]);
+      ctx.fillText(label, tx, ty + 1);
+    });
+  }, [peaks, selection, candidates, selectedCandidate, width, buffer, duration]);
 
   const xToTime = useCallback(
     (clientX: number): number => {

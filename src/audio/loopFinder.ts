@@ -11,6 +11,16 @@ export interface SeamSearchOptions {
   minLoopSamples?: number;
 }
 
+export interface SeamCandidateOptions extends SeamSearchOptions {
+  /** 返回的候选数量上限，默认 5 */
+  maxCandidates?: number;
+  /**
+   * 去重阈值（采样点）：两个候选的起点与终点相距均不足该值时视为同一接缝，
+   * 只保留代价更低者，避免同一局部极小值占满列表。默认 0（不去重）。
+   */
+  dedupeSamples?: number;
+}
+
 export interface SeamResult {
   /** 优化后的循环起点（采样点，含） */
   startSample: number;
@@ -21,7 +31,7 @@ export interface SeamResult {
 }
 
 /**
- * 在用户粗选的两个边界附近搜索最佳接缝点对。
+ * 在用户粗选的两个边界附近搜索代价最低的若干接缝点对（按代价升序）。
  *
  * 接缝代价 = Σ声道 ( |x[s] − x[e−1]| / RMS幅值
  *                  + w · |前向斜率(s) − 后向斜率(e)| / RMS斜率 )
@@ -29,16 +39,22 @@ export interface SeamResult {
  * 其中前向斜率取 s 之后 W 个采样点的平均变化率，
  * 后向斜率取 e 之前 W 个采样点的平均变化率。
  * 搜索采用「粗网格 + 局部细化」两级策略，半径很大时也能在毫秒内完成。
+ *
+ * 粗网格阶段维护一份按「起止点均相距不足 dedupeSamples」去重的优选列表，
+ * 使进入细化阶段的候选分布在不同的局部极小值上；细化后再次去重，
+ * 最终返回代价最低的前 maxCandidates 个。
  */
-export function findBestSeam(
+export function findSeamCandidates(
   audio: AudioDataLike,
   roughStart: number,
   roughEnd: number,
-  options: SeamSearchOptions,
-): SeamResult {
+  options: SeamCandidateOptions,
+): SeamResult[] {
   const W = Math.max(4, Math.round(options.slopeWindow ?? 32));
   const slopeWeight = options.slopeWeight ?? 1;
   const minLoop = Math.max(2, Math.round(options.minLoopSamples ?? 64));
+  const maxCandidates = Math.max(1, Math.round(options.maxCandidates ?? 5));
+  const dedupe = Math.max(0, Math.round(options.dedupeSamples ?? 0));
   const len = audio.length;
   const nCh = audio.numberOfChannels;
   const data: Float32Array[] = [];
@@ -73,9 +89,7 @@ export function findBestSeam(
 
   const sCount = sHi - sLo + 1;
   const eCount = eHi - eLo + 1;
-  if (sCount <= 0 || eCount <= 0) {
-    return { startSample: clamp(Math.round(roughStart), 0, len - 2), endSample: clamp(Math.round(roughEnd), 1, len), cost: NaN };
-  }
+  if (sCount <= 0 || eCount <= 0) return [];
 
   // ---- 预计算候选点特征（归一化后的幅值与短窗斜率）----
   const sVal: Float32Array[] = [];
@@ -113,49 +127,91 @@ export function findBestSeam(
     return c;
   };
 
+  // ---- 去重 + 按代价升序的有界列表 ----
+  const isDup = (a: SeamResult, b: SeamResult): boolean =>
+    Math.abs(a.startSample - b.startSample) < dedupe &&
+    Math.abs(a.endSample - b.endSample) < dedupe;
+
+  /** 向按代价升序的列表插入候选；与既有项重复时只保留更优者，超出容量截断 */
+  const insertSorted = (list: SeamResult[], cand: SeamResult, cap: number): void => {
+    // 去重关系不具备传递性，需扫描整个列表：移除所有比新候选差的重复项；
+    // 若存在不劣于新候选的重复项则直接丢弃
+    for (let k = list.length - 1; k >= 0; k--) {
+      if (isDup(list[k], cand)) {
+        if (cand.cost < list[k].cost - 1e-12) {
+          list.splice(k, 1);
+        } else {
+          return;
+        }
+      }
+    }
+    let pos = list.length;
+    while (pos > 0 && list[pos - 1].cost > cand.cost) pos--;
+    list.splice(pos, 0, cand);
+    if (list.length > cap) list.length = cap;
+  };
+
   // ---- 第一级：粗网格搜索（总评估数控制在 ~30 万以内）----
+  // 优选列表容量放宽到候选数的数倍，让不同局部极小值都有机会进入细化
   const totalPairs = sCount * eCount;
   const stride = Math.max(1, Math.round(Math.sqrt(totalPairs / 300_000)));
-  let best = Infinity;
-  let bi = 0;
-  let bj = 0;
-  let found = false;
+  const coarseCap = Math.max(maxCandidates * 3, 12);
+  const coarse: SeamResult[] = [];
   for (let i = 0; i < sCount; i += stride) {
     const sIdx = sLo + i;
     for (let j = 0; j < eCount; j += stride) {
       if (eLo + j - sIdx < minLoop) continue;
       const c = pairCost(i, j);
-      if (c < best) {
-        best = c;
-        bi = i;
-        bj = j;
-        found = true;
-      }
+      if (coarse.length >= coarseCap && c >= coarse[coarse.length - 1].cost) continue;
+      insertSorted(coarse, { startSample: sIdx, endSample: eLo + j, cost: c }, coarseCap);
     }
   }
 
-  // ---- 第二级：在最优点 ±stride 内逐采样点细化 ----
-  if (found && stride > 1) {
-    const iFrom = Math.max(0, bi - stride);
-    const iTo = Math.min(sCount - 1, bi + stride);
-    const jFrom = Math.max(0, bj - stride);
-    const jTo = Math.min(eCount - 1, bj + stride);
-    for (let i = iFrom; i <= iTo; i++) {
-      const sIdx = sLo + i;
-      for (let j = jFrom; j <= jTo; j++) {
-        if (eLo + j - sIdx < minLoop) continue;
-        const c = pairCost(i, j);
-        if (c < best) {
-          best = c;
-          bi = i;
-          bj = j;
+  // ---- 第二级：每个粗候选在 ±stride 内逐采样点细化，汇总后再去重 ----
+  const refined: SeamResult[] = [];
+  for (const seed of coarse) {
+    const bi = seed.startSample - sLo;
+    const bj = seed.endSample - eLo;
+    let best = seed.cost;
+    let bestI = bi;
+    let bestJ = bj;
+    if (stride > 1) {
+      const iFrom = Math.max(0, bi - stride);
+      const iTo = Math.min(sCount - 1, bi + stride);
+      const jFrom = Math.max(0, bj - stride);
+      const jTo = Math.min(eCount - 1, bj + stride);
+      for (let i = iFrom; i <= iTo; i++) {
+        const sIdx = sLo + i;
+        for (let j = jFrom; j <= jTo; j++) {
+          if (eLo + j - sIdx < minLoop) continue;
+          const c = pairCost(i, j);
+          if (c < best) {
+            best = c;
+            bestI = i;
+            bestJ = j;
+          }
         }
       }
     }
+    insertSorted(refined, { startSample: sLo + bestI, endSample: eLo + bestJ, cost: best }, maxCandidates);
   }
 
-  if (!found) {
-    return { startSample: clamp(Math.round(roughStart), 0, len - 2), endSample: clamp(Math.round(roughEnd), 1, len), cost: NaN };
-  }
-  return { startSample: sLo + bi, endSample: eLo + bj, cost: best };
+  return refined;
+}
+
+/**
+ * 只取最优接缝的便捷入口（等价于 findSeamCandidates 的第一名）。
+ * 搜索空间无效或未找到满足最短循环长度的点对时，回退为粗选边界且代价为 NaN。
+ */
+export function findBestSeam(
+  audio: AudioDataLike,
+  roughStart: number,
+  roughEnd: number,
+  options: SeamSearchOptions,
+): SeamResult {
+  const results = findSeamCandidates(audio, roughStart, roughEnd, { ...options, maxCandidates: 1 });
+  if (results.length > 0) return results[0];
+  const len = audio.length;
+  const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(v, b));
+  return { startSample: clamp(Math.round(roughStart), 0, len - 2), endSample: clamp(Math.round(roughEnd), 1, len), cost: NaN };
 }
